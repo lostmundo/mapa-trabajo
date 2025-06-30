@@ -1,0 +1,514 @@
+
+library(sf)        # Leer shapefiles
+library(tmap)      # Mapas bonitos
+library(dplyr)     # Manipulación
+library(readxl)    # Leer Excel
+library(geosphere) # Distancia entre coordenadas
+library(tidyverse)
+library(stringr)
+library(osrm)
+library(leaflet)
+library(viridis)
+library(htmltools)
+
+
+#==================== 
+#  LECTURA DE MAPA
+#====================
+
+#https://geoportal.dane.gov.co/servicios/descarga-y-metadatos/datos-geoestadisticos/ link de los datos obtenidos
+colombia_mapa_municipios <- st_read("datos-mapas/MGN2024_MPIO_POLITICO/MGN_ADM_MPIO_GRAFICO.shp")
+cundinamarca_municipio <- colombia_mapa_municipios |> # Realizar filtro de la base de datos de municipios por aquellos que pertenecen al departamento de Cundinamarca
+  filter(grepl("^cundinamarca\\b", tolower(trimws(dpto_cnmbr)))) |> 
+  select(-mpio_crslc, -mpio_tipo, -dpto_cnmbr) # Quitar estas columnas innecesarias de la base de datos 
+
+#=========================
+#--- INDICE DE POBREZA ---
+#=========================
+
+
+# ***** | Indice de pobreza Multidimencional | *****
+
+pobrezaoriginal <- read_excel("datos-mapas/POBREZA_Y_VIVIENDA_CUNDINAMARCA_F.xlsx", skip = 22) #Comenzar la lectura de la base de datos desde la fila 23 en adelante
+cundinamarca_municipio_PobrezaMul <- pobrezaoriginal |>  #Relizar filtro y selección de columnas que son necesarias
+  filter(!(MUN == "COLOMBIA" | DEP == "COLOMBIA" | MUN == "CUNDINAMARCA")) |> 
+  filter(INDICADOR == "INDICE DE POBREZA MULTIDIMENSIONAL - IPM") |> #Filtrar los datos de interés: variable IPM
+  select(-CODEP, -DEP,  -DIMENSION, -SUBCATEGORIA, -INDICADOR, -AREA,-ANO, -FUENTE, -UNIDAD)
+
+
+# ***** | Indice de necesidades insatisfechas | *****
+
+#Lectura de la base de datos del indice de Necesidades Basicas Satisfechas: https://www.dane.gov.co/index.php/estadisticas-por-tema/pobreza-y-condiciones-de-vida/necesidades-basicas-insatisfechas-nbi 
+Necesidades_insatisfecha <- read_excel("datos-mapas/necesidades_insatisfechas.xlsx", sheet = "Municipios", skip=9)
+#reasinar nombre de columnas 
+colnames(Necesidades_insatisfecha)[1:11] <- c("Codigo_Depart","Nombre_Depart","Codigo_Municipio","Nombre_Municipio","Prop_Personas_NBI","Prop_Personas_miseria","Componente_vivienda","Componente_Servicios","Componente_Hacinamiento","Componente_Inasistencia","Componente_dependencia_economica")
+#filtrar informacion por departamento de interes
+Necesidades_insatisfecha <- Necesidades_insatisfecha |>
+  select(1:11) |> 
+  filter(Codigo_Depart == 25)
+# Crear columna de componente dominante
+Necesidades_insatisfecha <- Necesidades_insatisfecha |> 
+  mutate(componente_dominante = pmap_chr( # Componente dominante: necesidad basica mayoritaria
+    list(Componente_vivienda, Componente_Servicios, Componente_Hacinamiento, Componente_Inasistencia, Componente_dependencia_economica),
+    ~ c("Vivienda", "Servicios", "Hacinamiento", "Inasistencia", "Dependencia_economica")[which.max(c(...))]
+  ))
+
+# ***** | Hogares y viviendas por Área | *****
+
+hogares <- pobrezaoriginal |> 
+  filter(!(MUN == "COLOMBIA" | DEP == "COLOMBIA" | MUN == "CUNDINAMARCA")) |> 
+  mutate(ANO= as.numeric(ANO)) |> # convertir la columna año en una variable numerica 
+  filter(grepl("^número.*area$", INDICADOR, ignore.case = TRUE) & grepl("^total$", AREA, ignore.case = TRUE) & ANO==2025 ) |> # filtrar de la base de datos la varible de interes mendiante condiciones
+  select(-CODEP, -DEP,  -DIMENSION, -SUBCATEGORIA, -INDICADOR, -AREA,-ANO, -FUENTE, -UNIDAD)
+
+#_______________________________________________
+# ***** | Unir datos en una sola base | *****
+
+#unir la pobreza multivariable a la base de datos principal
+cundinamarca_mapa_total <- cundinamarca_municipio |> 
+  left_join(cundinamarca_municipio_PobrezaMul, by = c("mpio_cdpmp"="CODMUN")) |> 
+  select(-MUN) |> 
+  rename("IPM" = "DATO")
+
+#Unir la Necesidades Basicas con la base de datos principal 
+cundinamarca_mapa_total <- cundinamarca_mapa_total |> 
+  left_join(
+    Necesidades_insatisfecha |> 
+      select(
+        cod_mpio = Codigo_Municipio,
+        nbi = Prop_Personas_NBI,
+        vivienda = Componente_vivienda,
+        servicios = Componente_Servicios,
+        hacinamiento = Componente_Hacinamiento,
+        inasistencia = Componente_Inasistencia,
+        dependencia_economica = Componente_dependencia_economica,
+        componente_dominante),
+        by = c("mpio_ccdgo"="cod_mpio"))
+
+#Unir Los Hogares por area con la base de datos principal
+cundinamarca_mapa_total <- cundinamarca_mapa_total |> 
+  left_join(
+    hogares |> 
+      select(
+        cod_mpio = CODMUN,
+        NHA = DATO
+      ),
+    by=c("mpio_cdpmp"="cod_mpio")
+  )
+
+#_______________________________________________
+# ***** | CREAR MAPA IMP y INB| *****
+
+#Asignar Paleta de Colores
+pal_ipm <- colorNumeric("viridis", cundinamarca_mapa_total$IPM)
+pal_nbi <- colorNumeric("viridis", cundinamarca_mapa_total$nbi)
+
+# Crear etiquetas enriquecidas para tooltip
+etiquetas_imp <- sprintf(
+  "<strong>%s</strong><br/>Índice PM: %s",
+  cundinamarca_mapa_total$mpio_cnmbr,
+  cundinamarca_mapa_total$IPM
+) |> lapply(HTML)
+
+#Crear etiqueta enriquecidas 
+etiquetas_nbi <- sprintf(
+  "<strong>%s</strong><br/>Necesidad Basica Dominante: %s",
+  cundinamarca_mapa_total$mpio_cnmbr,
+  cundinamarca_mapa_total$componente_dominante
+) |> lapply(HTML)
+
+# Crear mapa leaflet centrado y restringido a Cundinamarca
+leaflet(cundinamarca_mapa_total, options = leafletOptions(minZoom = 7.5, maxZoom = 12)) |>
+  setView(lng = -74.3, lat = 4.8, zoom = 9) |>
+  addProviderTiles("CartoDB.Positron") |>
+  
+  # Capa IPM
+  addPolygons(
+    fillColor = ~pal_ipm(IPM),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    group = "IPM",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    label = etiquetas_imp,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  )|>
+  # Capa NBI
+  addPolygons(
+    fillColor = ~pal_nbi(nbi),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.9,
+      bringToFront = TRUE),
+    group = "NBI",
+    label = etiquetas_nbi,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  ) |>
+  
+  # Leyendas
+  addLegend("bottomright", pal = pal_ipm, values = ~IPM, title = "Indice Pobreza Mult.", group = "IPM") |>
+  addLegend("bottomright", pal = pal_nbi, values = ~nbi, title = "Indice Nec. Basicas Ins.", group = "NBI") |>
+  
+  # Control de capas
+  addLayersControl(
+    baseGroups = c("IPM", "NBI"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |> 
+  addControl(
+      html = tags$div(
+        style = "padding: 10px; background: rgba(255,255,255,0.9); border-radius: 8px; box-shadow: 0 0 8px rgba(0,0,0,0.3);",
+        HTML("<strong>Mapa de Cundinamarca</strong><br/>
+          <small>Pobreza Multidimensional Y Necesidades Basicas Insatisfechas<br/>
+          Fuente: DANE· Elaboración propia</small>")
+    ),
+    position = "topleft" # Posición de titulo 
+  )
+
+#_______________________________________________
+# ***** | CREAR MAPA NHA| *****
+
+#Asignar Paleta de Colores
+pal_NHA <- colorNumeric("viridis", cundinamarca_mapa_total$NHA)
+
+# Crear etiquetas enriquecidas para tooltip
+etiquetas_NHA <- sprintf(
+  "<strong>%s</strong><br/>Número Hogares Area: %s",
+  cundinamarca_mapa_total$mpio_cnmbr,
+  cundinamarca_mapa_total$NHA
+) |> lapply(HTML)
+
+# Crear mapa leaflet centrado y restringido a Cundinamarca
+leaflet(cundinamarca_mapa_total, options = leafletOptions(minZoom = 7.5, maxZoom = 12)) |>
+  setView(lng = -74.3, lat = 4.8, zoom = 9) |>
+  addProviderTiles("CartoDB.Positron") |>
+  
+  # Capa IPM
+  addPolygons(
+    fillColor = ~pal_NHA(NHA),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    group = "NHA",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    label = etiquetas_NHA,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  )|>
+  
+  # Leyendas
+  addLegend("bottomright", pal = pal_NHA, values = ~NHA, title = "Numero Hogares Area", group = "NHA") |>
+  
+  # Control de capas
+  addLayersControl(
+    baseGroups = c("NHA"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |> 
+  addControl(
+      html = tags$div(
+        style = "padding: 10px; background: rgba(255,255,255,0.9); border-radius: 8px; box-shadow: 0 0 8px rgba(0,0,0,0.3);",
+        HTML("<strong>Mapa de Cundinamarca</strong><br/>
+          <small>Número de hogares por Área (2025)<br/>
+          Fuente: IDEE· Elaboración propia</small>")
+    ),
+    position = "topleft" # Posición de titulo 
+  )
+
+
+#=====================
+#--- Desempeño Fiscal ---
+#=====================
+
+#Desarrollo del segundo Mapa bajo la temática de Desempeño Fiscal
+
+Desemp_fiscal <- read_excel("datos-mapas/IDesempFiscal.xlsx", sheet = "Municipios 2023",skip=6) # realizar lectura de la base de datos: https://www.dnp.gov.co/LaEntidad_/subdireccion-general-descentralizacion-desarrollo-territorial/direccion-descentralizacion-fortalecimiento-fiscal/Paginas/informacion-fiscal-y-financiera.aspx
+Desemp_fiscal <- Desemp_fiscal |> 
+  filter(grepl("^cundinamarca\\b", tolower(trimws(Departamento))))
+
+#Desempeño entre la dependencia de las transferencias y el ahorro corriente
+Desemp_fiscal$saldo_Transferencia_Ahorro <- as.numeric(Desemp_fiscal$`Dependencia de las Transferencias`) - as.numeric(Desemp_fiscal$`Ahorro Corriente`)
+
+#unir datos en un solo data frame
+cundinamarca_mapa_desempFiscal <- cundinamarca_municipio |> 
+  left_join( Desemp_fiscal |> 
+               select(
+                 cod_mpio = `Código`,
+                 depenTransf = `Dependencia de las Transferencias`,
+                 ahorro =`Ahorro Corriente`,
+                 desempeño_fiscal= `Nuevo IDF`,
+                 saldo = saldo_Transferencia_Ahorro
+               ), by=c("mpio_cdpmp"="cod_mpio")) |> 
+  mutate(saldo = round(saldo, 3))
+
+#__________________________________________________________________________________
+# ***** | CREAR MAPA Desempeño Fiscal y Transferencias Economicas vs Ahorro | *****
+
+#Asignar Paleta de Colores
+pal_IDF <- colorNumeric("viridis", cundinamarca_mapa_desempFiscal$desempeño_fiscal)
+pal_saldo <- colorNumeric("viridis", cundinamarca_mapa_desempFiscal$saldo)
+
+# Crear etiquetas enriquecidas para tooltip
+etiquetas_IDF <- sprintf(
+  "<strong>%s</strong><br/>Desempeño Fiscal: %.1f%%",
+  cundinamarca_mapa_desempFiscal$mpio_cnmbr,
+  cundinamarca_mapa_desempFiscal$desempeño_fiscal
+) |> lapply(HTML)
+
+#Crear etiqueta enriquecidas 
+etiquetas_saldo <- sprintf(
+  "<strong>%s</strong><br/> Difer. DepTransf-Ahorro: %s",
+  cundinamarca_mapa_desempFiscal$mpio_cnmbr,
+  cundinamarca_mapa_desempFiscal$saldo
+) |> lapply(HTML)
+
+# Crear mapa leaflet centrado y restringido a Cundinamarca
+leaflet(cundinamarca_mapa_desempFiscal, options = leafletOptions(minZoom = 7.5, maxZoom = 12)) |>
+  setView(lng = -74.3, lat = 4.8, zoom = 9) |>
+  addProviderTiles("CartoDB.Positron") |>
+  
+  # Capa Desempeño Fiscal
+  addPolygons(
+    fillColor = ~pal_IDF(desempeño_fiscal),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    group = "Desempeño Fiscal",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    label = etiquetas_IDF,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  )|>
+  # Capa Saldo - Trsnfe - Ahorro
+  addPolygons(
+    fillColor = ~pal_saldo(saldo),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.9,
+      bringToFront = TRUE),
+    group = "Saldo Transferencias-Ahorro",
+    label = etiquetas_saldo,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  ) |>
+  
+  # Leyendas
+  addLegend("bottomright", pal =pal_IDF, values = ~desempeño_fiscal, title = "Desempeño fiscal", group = "Desempeño Fiscal") |>
+  addLegend("bottomright", pal = pal_saldo, values = ~saldo, title = "Diff. DepeTrns - Ahor", group = "Saldo Transferencias-Ahorro") |>
+  
+  # Control de capas
+  addLayersControl(
+    baseGroups = c("Desempeño Fiscal", "Saldo Transferencias-Ahorro"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |> 
+  addControl(
+      html = tags$div(
+        style = "padding: 10px; background: rgba(255,255,255,0.9); border-radius: 8px; box-shadow: 0 0 8px rgba(0,0,0,0.3);",
+        HTML("<strong>Mapa de Cundinamarca</strong><br/>
+          <small>Desempeño Fiscal Y Dependencia de Transferencias Vs Ahorro Corriente (2023)<br/>
+          Fuente: DNP· Elaboración propia</small>")
+    ),
+    position = "topleft" # Posición de titulo 
+  )
+
+
+#========================
+#--- Distancia ---
+#========================
+
+#Crear centroide desde bogotá 
+
+bogota_point <- data.frame(
+  id="BOGOTA",
+  lon = -74.0721,
+  lat = 4.7110
+  ) |> 
+  st_as_sf(coords = c("lon","lat"), crs=4326)
+
+#Calcular centroides y guardar en objetos 
+centroides <- cundinamarca_municipio |> 
+  mutate(id=as.character(mpio_cnmbr)) |> 
+  st_centroid() 
+
+#Extraer coordenadas
+coords <- st_coordinates(centroides)
+
+#Unirlas coodenadas
+municipios_pts <- centroides |> 
+  mutate(lon= coords[,1],
+         lat= coords[,2]) |> 
+  select(id, mpio_cdpmp, lon, lat, geometry)
+
+#Nombre de los municipios
+nombre_municip <-municipios_pts$mpio_cdpmp
+
+#calcular distancia viales desde bogotá a todos los municipios 
+distancias <- osrmTable(src=bogota_point, dst=municipios_pts, measure = "distance")
+
+#Extraer la distancia creada
+dist_km_municipios <- distancias$distances |> 
+  t() |> 
+  as.data.frame() 
+
+#Asignar nombres como rownames
+rownames(dist_km_municipios) <- nombre_municip
+
+#data frame de distancias a la capital
+dist_km_municipios <- dist_km_municipios |> 
+  rownames_to_column("Municipio") |> 
+  rename(Distancia_km = 2)
+
+#Unir base de datos 
+cundinamarca_mapa_distancia <- cundinamarca_municipio |> 
+  left_join(
+    dist_km_municipios, by=c("mpio_cdpmp"="Municipio") 
+  ) |> 
+  left_join(
+    Desemp_fiscal |> 
+      select(
+        cod_mpio = `Código`,
+        capacidad_inv=`Capacidad de Ejecución de Inversión`), by=c("mpio_cdpmp"="cod_mpio")
+  )
+
+#___________________________________________________________________________
+# ***** | CREAR MAPA Distancia a Bogotá Ejecución presupuesto fiscal| *****
+
+#Convertir numeric la columna capacidad_inv
+cundinamarca_mapa_distancia <- cundinamarca_mapa_distancia |>
+  mutate(capacidad_inv = as.numeric(capacidad_inv))
+
+#Asignar Paleta de Colores
+pal_dist <- colorNumeric("viridis", cundinamarca_mapa_distancia$Distancia_km)
+pal_eject <- colorNumeric("viridis", cundinamarca_mapa_distancia$capacidad_inv)
+
+# Crear etiquetas enriquecidas para tooltip
+etiquetas_dist <- sprintf(
+  "<strong>%s</strong><br/>Distancia Km: %.1f Km",
+  cundinamarca_mapa_distancia$mpio_cnmbr,
+  cundinamarca_mapa_distancia$Distancia_km
+) |> lapply(HTML)
+
+#Crear etiqueta enriquecidas 
+etiquetas_invers <- sprintf(
+  "<strong>%s</strong><br/> Cap. Ejec. Presupuesto: %s",
+  cundinamarca_mapa_distancia$mpio_cnmbr,
+  cundinamarca_mapa_distancia$capacidad_inv
+) |> lapply(HTML)
+
+# Crear mapa leaflet centrado y restringido a Cundinamarca
+leaflet(cundinamarca_mapa_distancia, options = leafletOptions(minZoom = 7.5, maxZoom = 12)) |>
+  setView(lng = -74.3, lat = 4.8, zoom = 9) |>
+  addProviderTiles("CartoDB.Voyager") |>
+  
+  # Capa Distancia Km
+  addPolygons(
+    fillColor = ~pal_dist(Distancia_km),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    group = "Distancia a Bogotá",
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.3,
+      bringToFront = TRUE
+    ),
+    label = etiquetas_dist,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  )|>
+  # Capa capacidad de ejecucion del presupuesto
+  addPolygons(
+    fillColor = ~pal_eject(capacidad_inv),
+    color = "white",
+    weight = 1,
+    opacity = 1,
+    fillOpacity = 0.8,
+    highlight = highlightOptions(
+      weight = 2,
+      color = "#333",
+      fillOpacity = 0.3,
+      bringToFront = TRUE),
+    group = "Capacidad Presupuestal",
+    label = etiquetas_invers,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "bold", "color" = "#222"),
+      textsize = "14px",
+      direction = "auto"
+    )
+  ) |>
+  
+  # Leyendas
+  addLegend("bottomright", pal =pal_dist, values = ~Distancia_km, title = "Distancia a Bogotá", group = "Distancia a Bogotá") |>
+  addLegend("bottomright", pal = pal_eject, values = ~capacidad_inv, title = "Capacidad Presupuestal", group = "Capacidad Presupuestal") |>
+  
+  # Control de capas
+  addLayersControl(
+    baseGroups = c("Distancia a Bogotá", "Capacidad Presupuestal"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |> 
+  addControl(
+    html = tags$div(
+      style = "padding: 10px; background: rgba(255,255,255,0.9); border-radius: 8px; box-shadow: 0 0 8px rgba(0,0,0,0.3);",
+      HTML("<strong>Mapa de Cundinamarca</strong><br/>
+          <small>Distancia a Bogotá y capacidad de ejecución presupuestal<br/>
+          Fuente: DNP – Elaboración propia</small>")
+    ),
+    position = "topleft" # Posición de titulo 
+  ) |> 
+  addCircleMarkers(data = bogota_point,
+                   radius = 6,
+                   color = "red",
+                   stroke = TRUE,
+                   fillOpacity = 0.9,
+                   label = "Bogotá D.C.") 
+
+
+

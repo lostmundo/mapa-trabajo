@@ -1,0 +1,66 @@
+# Archivos de R y RStudio que no deben subirse
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+.Rout
+.Rout.save
+*.Rproj
+
+# Archivos de datos y mapas grandes
+datos-mapas/**/*.shp
+datos-mapas/**/*.shx
+datos-mapas/**/*.dbf
+datos-mapas/**/*.prj
+datos-mapas/**/*.csv
+datos-mapas/**/*.xlsx
+datos-mapas/**/*.rds
+datos-mapas/**/*.zip
+
+# Archivos generados por scripts o análisis
+*.rds
+*.rda
+*.RData
+*.csv
+*.xlsx
+*.zip
+*.html
+*.pdf
+*.docx
+*.svg
+*.png
+*.jpeg
+*.jpg
+
+# 1. Añadir reglas al .gitignore
+echo "datos-mapas/**/*.shp" >> .gitignore
+echo "datos-mapas/**/*.dbf" >> .gitignore
+echo "datos-mapas/**/*.shx" >> .gitignore
+echo "datos-mapas/**/*.csv" >> .gitignore
+echo "*.xlsx" >> .gitignore
+echo "*.rds" >> .gitignore
+echo "*.html" >> .gitignore
+
+# Carpeta de caché de RMarkdown o Quarto
+_cache/
+_site/
+*.utf8.md
+*.knit.md
+*.nb.html
+
+# Archivos de sistema (Mac y Windows)
+.DS_Store
+Thumbs.db
+
+# Archivos temporales de instalación o paquetes
+.Rcheck/
+*.tar.gz
+*.o
+*.so
+*.dll
+
+# Archivos del navegador (si abres archivos HTML generados)
+*.log
+*.tmp
+*.bak
